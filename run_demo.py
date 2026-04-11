@@ -3,9 +3,9 @@ Demo script: Inject HopfieldCompressedAttention into a Llama model and run text 
 
 Usage:
     python run_demo.py                           # Use a small Llama model from HF
-    python run_demo.py --model meta-llama/Llama-3.2-1B
+    python run_demo.py --model TinyLlama/TinyLlama-1.1B-Chat-v1.0
     python run_demo.py --prompt "The future of AI is"
-    python run_demo.py --beta 2.0 --chunk_size 4 --top_k_ratio 0.3
+    python run_demo.py --beta 4.0 --chunk_size 8 --top_k_ratio 0.75
 """
 
 import argparse
@@ -26,31 +26,35 @@ def inject_hopfield_attention(model, config):
     for layer_idx, layer in enumerate(model.model.layers):
         old_attn = layer.self_attn
 
-        # Create new HopfieldCompressedAttention with same config
         new_attn = HopfieldCompressedAttention(model.config, layer_idx=layer_idx)
-
-        # Copy all parameters from the original attention module
         new_attn.load_state_dict(old_attn.state_dict(), strict=False)
-
-        # Move to same device / dtype
         new_attn = new_attn.to(
             device=next(old_attn.parameters()).device,
             dtype=next(old_attn.parameters()).dtype,
         )
 
-        # Inject
         layer.self_attn = new_attn
         replaced += 1
 
-    print(f"[✓] Replaced {replaced} attention layers with HopfieldCompressedAttention")
-    print(f"    β={model.config.hopfield_beta}, chunk_size={model.config.chunk_size}, "
-          f"top_k_ratio={model.config.top_k_ratio}")
+    print(f"[+] Replaced {replaced} attention layers with HopfieldCompressedAttention")
+    print(f"    beta={model.config.hopfield_beta}, steps={model.config.hopfield_steps}, "
+          f"chunk_size={model.config.chunk_size}, top_k_ratio={model.config.top_k_ratio}")
     return model
+
+
+def measure_kv_cache_size(cache) -> int:
+    """Return total KV cache size in bytes."""
+    total = 0
+    for layer in cache.layers:
+        if layer.is_initialized:
+            total += layer.keys.numel() * layer.keys.element_size()
+            total += layer.values.numel() * layer.values.element_size()
+    return total
 
 
 def main():
     parser = argparse.ArgumentParser(description="Hopfield-Compressed Attention Demo")
-    parser.add_argument("--model", type=str, default="meta-llama/Llama-3.2-1B",
+    parser.add_argument("--model", type=str, default="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
                         help="HuggingFace model ID")
     parser.add_argument("--prompt", type=str,
                         default="The key innovation in modern transformer architectures is",
@@ -58,12 +62,14 @@ def main():
     parser.add_argument("--max_new_tokens", type=int, default=64,
                         help="Number of tokens to generate")
 
-    # Hopfield compression hyperparameters
-    parser.add_argument("--beta", type=float, default=1.0,
-                        help="Hopfield inverse temperature")
+    # Hopfield compression hyperparameters (v2 defaults)
+    parser.add_argument("--beta", type=float, default=4.0,
+                        help="Hopfield inverse temperature (higher = sharper prototype)")
+    parser.add_argument("--hopfield_steps", type=int, default=3,
+                        help="Hopfield update iterations per prototype")
     parser.add_argument("--chunk_size", type=int, default=8,
                         help="Tokens per chunk for compression")
-    parser.add_argument("--top_k_ratio", type=float, default=0.5,
+    parser.add_argument("--top_k_ratio", type=float, default=0.75,
                         help="Fraction of chunks to keep uncompressed")
     parser.add_argument("--compress_threshold", type=int, default=32,
                         help="Min sequence length to trigger compression")
@@ -89,29 +95,29 @@ def main():
     print(f"Device: {device}")
     print(f"Loading model: {args.model} ...")
 
-    # Load model and tokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
         torch_dtype=torch.float32 if device == "cpu" else torch.float16,
         device_map=device,
-        attn_implementation="eager",  # We need explicit attention weights
+        attn_implementation="eager",
     )
     model.eval()
 
-    # Set compression hyperparameters on config (so layers can read them)
+    # Set compression hyperparameters on config
     model.config.hopfield_beta = args.beta
+    model.config.hopfield_steps = args.hopfield_steps
     model.config.chunk_size = args.chunk_size
     model.config.top_k_ratio = args.top_k_ratio
     model.config.compress_threshold = args.compress_threshold
     model.config.rank_iterations = args.rank_iterations
 
-    # --- Baseline generation (standard attention) ---
-    print("\n" + "=" * 60)
-    print("BASELINE (standard LlamaAttention)")
-    print("=" * 60)
-
     inputs = tokenizer(args.prompt, return_tensors="pt").to(device)
+
+    # ── Baseline ──────────────────────────────────────────────────
+    print("\n" + "=" * 70)
+    print("  BASELINE (standard LlamaAttention)")
+    print("=" * 70)
 
     t0 = time.time()
     with torch.no_grad():
@@ -124,26 +130,20 @@ def main():
         )
     baseline_time = time.time() - t0
     baseline_text = tokenizer.decode(baseline_out[0], skip_special_tokens=True)
+    baseline_kv_size = measure_kv_cache_size(baseline_cache)
 
-    # Measure baseline KV cache size
-    baseline_kv_size = sum(
-        k.numel() * k.element_size() + v.numel() * v.element_size()
-        for k, v in zip(baseline_cache.key_cache, baseline_cache.value_cache)
-        if k.numel() > 0
-    )
+    print(f"  Prompt : {args.prompt}")
+    print(f"  Output : {baseline_text}")
+    print(f"  Time   : {baseline_time:.2f}s")
+    print(f"  KV size: {baseline_kv_size / 1024:.1f} KB")
 
-    print(f"Prompt: {args.prompt}")
-    print(f"Output: {baseline_text}")
-    print(f"Time:   {baseline_time:.2f}s")
-    print(f"KV cache size: {baseline_kv_size / 1024:.1f} KB")
-
-    # --- Inject Hopfield-compressed attention ---
+    # ── Inject compressed attention ───────────────────────────────
     model = inject_hopfield_attention(model, model.config)
 
-    # --- Compressed generation ---
-    print("\n" + "=" * 60)
-    print("HOPFIELD-COMPRESSED ATTENTION")
-    print("=" * 60)
+    # ── Compressed generation ─────────────────────────────────────
+    print("\n" + "=" * 70)
+    print("  HOPFIELD-COMPRESSED ATTENTION (v2)")
+    print("=" * 70)
 
     t0 = time.time()
     with torch.no_grad():
@@ -156,28 +156,26 @@ def main():
         )
     compressed_time = time.time() - t0
     compressed_text = tokenizer.decode(compressed_out[0], skip_special_tokens=True)
+    compressed_kv_size = measure_kv_cache_size(compressed_cache)
 
-    # Measure compressed KV cache size
-    compressed_kv_size = sum(
-        k.numel() * k.element_size() + v.numel() * v.element_size()
-        for k, v in zip(compressed_cache.key_cache, compressed_cache.value_cache)
-        if k.numel() > 0
-    )
+    print(f"  Prompt : {args.prompt}")
+    print(f"  Output : {compressed_text}")
+    print(f"  Time   : {compressed_time:.2f}s")
+    print(f"  KV size: {compressed_kv_size / 1024:.1f} KB")
 
-    print(f"Prompt: {args.prompt}")
-    print(f"Output: {compressed_text}")
-    print(f"Time:   {compressed_time:.2f}s")
-    print(f"KV cache size: {compressed_kv_size / 1024:.1f} KB")
-
-    # --- Comparison ---
-    print("\n" + "=" * 60)
-    print("COMPARISON")
-    print("=" * 60)
+    # ── Comparison ────────────────────────────────────────────────
+    print("\n" + "=" * 70)
+    print("  COMPARISON")
+    print("=" * 70)
     if baseline_kv_size > 0:
         ratio = compressed_kv_size / baseline_kv_size
-        print(f"KV cache compression ratio: {ratio:.2%} of baseline")
-        print(f"Memory saved: {(1 - ratio) * 100:.1f}%")
-    print(f"Speed: baseline {baseline_time:.2f}s vs compressed {compressed_time:.2f}s")
+        saving = (1 - ratio) * 100
+        print(f"  KV cache ratio  : {ratio:.2%} of baseline")
+        print(f"  Memory saved    : {saving:.1f}%")
+    print(f"  Speed           : baseline {baseline_time:.2f}s  vs  compressed {compressed_time:.2f}s")
+    if baseline_time > 0:
+        overhead = (compressed_time - baseline_time) / baseline_time * 100
+        print(f"  Speed overhead  : {overhead:+.1f}%")
 
 
 if __name__ == "__main__":
